@@ -112,6 +112,9 @@ typedef ssize_t (*sendmsgFnType)(int sockfd, const struct msghdr* msg, int flags
 typedef ssize_t (*recvFnType)(int, void*, size_t, int);
 typedef ssize_t (*recvmsgFnType)(int sockfd, struct msghdr* msg, int flags);
 typedef int (*closeFnType)(int fd);
+typedef int (*epoll_createFnType)(int size);
+typedef int (*epoll_ctlFnType)(int epfd, int op, int fd, struct epoll_event *event);
+typedef int (*epoll_waitFnType)(int epfd, struct epoll_event *events, int maxevents, int timeout);
 
 /*static openFnType fibershim_open = NULL;
 static pollFnType fibershim_poll = NULL;
@@ -134,6 +137,9 @@ static pipeFnType fibershim_pipe = NULL;
 static fcntlFnType fibershim_fcntl = NULL;
 static ioctlFnType fibershim_ioctl = NULL;
 static closeFnType fibershim_close = NULL;
+static epoll_createFnType fibershim_epoll_create = NULL;
+static epoll_ctlFnType fibershim_epoll_ctl = NULL;
+static epoll_waitFnType fibershim_epoll_wait = NULL;
 
 #define STRINGIFY(x) XSTRINGIFY(x)
 #define XSTRINGIFY(x) #x
@@ -185,6 +191,11 @@ int fiber_io_init()
     fibershim_recvmsg = (recvmsgFnType)dlsym(RTLD_NEXT, "recvmsg");
     fibershim_close = (closeFnType)dlsym(RTLD_NEXT, "close");
 
+    // EPOLL APIs
+    fibershim_epoll_create = (epoll_createFnType)dlsym(RTLD_NEXT,"epoll_create");
+    fibershim_epoll_ctl = (epoll_ctlFnType)dlsym(RTLD_NEXT,"epoll_ctl");
+    fibershim_epoll_wait = (epoll_waitFnType)dlsym(RTLD_NEXT,"epoll_wait");
+    
     if(fd_info) {
         return FIBER_ERROR;
     }
@@ -633,9 +644,10 @@ int fcntl(int fd, int cmd, ...)
     va_end(args);
 
     if(!thread_locked) {
-        if(cmd == F_SETFL && (val == O_NONBLOCK || val == O_NDELAY)) {
+        if(cmd == F_SETFL && (val & O_NONBLOCK || val & O_NDELAY)) {
             assert(fd < max_fd);
             __sync_fetch_and_and(&fd_info[fd].flags_, ~IO_FLAG_BLOCKING);
+            __sync_fetch_and_and(&fd_info[fd].flags_, ~IO_FLAG_WAITABLE);
             assert(!(fd_info[fd].flags_ & IO_FLAG_BLOCKING));
             return 0;
         }

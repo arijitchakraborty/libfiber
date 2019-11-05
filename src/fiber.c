@@ -100,6 +100,7 @@ fiber_t* fiber_create_no_sched(size_t stack_size, fiber_run_function_t run_funct
     ret->join_info = NULL;
     ret->result = NULL;
     ret->id += 1;
+    ret->num_events = 0;
     if(FIBER_SUCCESS != fiber_context_init(&ret->context, stack_size, &fiber_go_function, ret)) {
         free(ret);
         return NULL;
@@ -136,6 +137,7 @@ fiber_t* fiber_create_from_thread()
     ret->join_info = NULL;
     ret->result = NULL;
     ret->id = 1;
+    ret->num_events = 0;
     if(FIBER_SUCCESS != fiber_context_init_from_thread(&ret->context)) {
         free(ret);
         return NULL;

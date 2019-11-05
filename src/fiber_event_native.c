@@ -34,6 +34,10 @@
 #error OS not supported
 #endif
 
+static fiber_t* fiber_epfds[1024] = {0};
+static int fiber_epfds_idx;
+static int fiber_watched_fds[10240] = {0};
+
 typedef struct fd_wait_info
 {
     int events;
@@ -41,6 +45,14 @@ typedef struct fd_wait_info
     fiber_spinlock_t spinlock;
     void* waiters;
 } fd_wait_info_t;
+
+typedef struct epfd_wait_info
+{
+    int events;
+    int added;
+    fiber_spinlock_t spinlock;
+    void* waiters;
+} epfd_wait_info_t;
 
 static fd_wait_info_t* wait_info = NULL;
 static int max_fd = 0;
@@ -138,12 +150,12 @@ int fiber_event_init()
 
     fibershim_read = (readFnType)fiber_load_symbol("read");
 
-    const int the_event_fd = epoll_create(1);
+    const int the_event_fd = __epoll_create_internal(1);
     assert(the_event_fd >= 0);
     struct epoll_event e = {};
     e.events = EPOLLIN;
     e.data.fd = timer_fd;
-    ret = epoll_ctl(the_event_fd, EPOLL_CTL_ADD, timer_fd, &e);
+    ret = __epoll_ctl_internal(the_event_fd, EPOLL_CTL_ADD, timer_fd, &e);
     assert(!ret);
 #elif defined(SOLARIS)
     const int the_event_fd = port_create();
@@ -235,8 +247,10 @@ static void fiber_event_wake_sleepers(fiber_manager_t* manager, uint64_t trigger
 static int fiber_poll_events_internal(uint32_t seconds, uint32_t useconds)
 {
 #if defined(LINUX)
-    struct epoll_event events[64];
-    const int count = epoll_wait(event_fd, events, 64, seconds * 1000 + useconds / 1000);
+    int fiber_watched_fd_count = 0;
+    struct epoll_event events[1024];
+    const int count = __epoll_wait_internal(manager->event_fd, events, 1024, 0);
+
     if(count < 0) {
         if(errno == EINTR) { //interrupted, just try again later (could be gdb'ing etc)
             return 0;
@@ -252,14 +266,42 @@ static int fiber_poll_events_internal(uint32_t seconds, uint32_t useconds)
     int i;
     for(i = 0; i < count; ++i) {
         const int the_fd = events[i].data.fd;
-        if(the_fd == timer_fd) {
+        if(the_fd == manager->timer_fd) {
             uint64_t timer_count = 0;
-            const int ret = fibershim_read(timer_fd, &timer_count, sizeof(timer_count));
+            const int ret = fibershim_read(manager->timer_fd, &timer_count, sizeof(timer_count));
             if(ret != sizeof(timer_count)) {
                 assert(errno == EWOULDBLOCK || errno == EAGAIN);
                 continue;
             }
             fiber_event_wake_sleepers(manager, timer_count);
+        } else if( fiber_watched_fds[the_fd]!=0 ) { // its a fd which a fiber is watching
+            int the_fiber_epfd = fiber_watched_fds[the_fd];
+            fiber_t* the_fiber = fiber_epfds[the_fiber_epfd];
+
+            if(the_fiber->state == FIBER_STATE_WAITING && manager == the_fiber->my_manager){
+
+                fd_wait_info_t* const info = &wait_info[the_fd];
+                fiber_spinlock_lock(&info->spinlock);
+                info->events &= ~events[i].events;
+                info->events &= EPOLLIN | EPOLLOUT;
+                if(info->events) {
+                    struct epoll_event e;
+                    e.events = EPOLLONESHOT | info->events;
+                    e.data.fd = the_fd;
+                    __epoll_ctl_internal(manager->event_fd, EPOLL_CTL_MOD, e.data.fd, &e);
+                }
+                fiber_event_wake_waiters(manager, info, 0);
+                if (the_fiber->state == FIBER_STATE_READY){
+                    *(the_fiber->events + the_fiber->num_events++) = *(events+i);
+                    fiber_watched_fd_count++;
+                }
+                fiber_spinlock_unlock(&info->spinlock);
+            }
+
+            if(the_fiber->state == FIBER_STATE_EPOLL_WAITING && manager == the_fiber->my_manager) {
+                *(the_fiber->events + the_fiber->num_events++) = *(events+i);
+                fiber_watched_fd_count++;
+            }
         } else {
             fd_wait_info_t* const info = &wait_info[the_fd];
             fiber_spinlock_lock(&info->spinlock);
@@ -269,13 +311,23 @@ static int fiber_poll_events_internal(uint32_t seconds, uint32_t useconds)
                 struct epoll_event e;
                 e.events = EPOLLONESHOT | info->events;
                 e.data.fd = the_fd;
-                epoll_ctl(event_fd, EPOLL_CTL_MOD, e.data.fd, &e);
+                __epoll_ctl_internal(manager->event_fd, EPOLL_CTL_MOD, e.data.fd, &e);
             }
             fiber_event_wake_waiters(manager, info, 0);
             fiber_spinlock_unlock(&info->spinlock);
         }
     }
-    return count;
+    for(i = 1; i <= fiber_epfds_idx; ++i) {
+        fiber_t* _the_fiber = fiber_epfds[i];
+        if( _the_fiber &&
+            ( manager == _the_fiber->my_manager ) &&
+            ( _the_fiber->state == FIBER_STATE_EPOLL_WAITING ) ) {
+            _the_fiber->state = FIBER_STATE_READY;
+            fiber_manager_schedule(manager, _the_fiber);
+        }
+    }
+
+    return count-fiber_watched_fd_count;
 #elif defined(SOLARIS)
     port_event_t events[64];
     uint_t nget = 1;
@@ -441,3 +493,43 @@ void fiber_fd_closed(int fd)
     fiber_spinlock_unlock(&info->spinlock);
 }
 
+
+// EPOLL related stuffs
+
+int fiber_epfd_create(int size)
+{
+    fiber_manager_t* const manager = fiber_manager_get(0);
+    fiber_t* const this_fiber = manager->current_fiber;
+    int _current_epfds_idx = __sync_add_and_fetch(&fiber_epfds_idx, 1);
+    fiber_epfds[_current_epfds_idx] = this_fiber;
+    return _current_epfds_idx;
+}
+
+int fiber_epfd_ctl(int epfd, int op, int fd, struct epoll_event *event)
+{
+    fiber_t* __fiber = fiber_epfds[epfd]; // get the fiber which owns this fd
+    fiber_manager_t* const manager = __fiber->my_manager;
+
+    if(op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD || op == EPOLL_CTL_DEL) {
+        if(op == EPOLL_CTL_DEL) {
+            fiber_watched_fds[fd] = 0;
+        } else {
+            fiber_watched_fds[fd] = epfd;
+        }
+        return __epoll_ctl_internal(manager->event_fd, op, fd, event);
+    } else {
+        assert(1 == 0);
+        return -1;
+    }
+}
+
+int fiber_epfd_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
+{
+    fiber_manager_t* const manager = fiber_manager_get(0);
+    fiber_t* const this_fiber = manager->current_fiber;
+    this_fiber->state = FIBER_STATE_EPOLL_WAITING;
+    this_fiber->num_events = 0;
+    this_fiber->events = events;
+    fiber_manager_yield(manager);
+    return this_fiber->num_events;
+}

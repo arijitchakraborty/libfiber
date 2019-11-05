@@ -18,6 +18,7 @@
 #define _FIBER_FIBER_H_
 
 #include <stdint.h>
+#include <sys/epoll.h>
 #include "fiber_context.h"
 #include "mpsc_fifo.h"
 
@@ -30,6 +31,7 @@ struct fiber_manager;
 #define FIBER_STATE_WAITING (3)
 #define FIBER_STATE_DONE (4)
 #define FIBER_STATE_SAVING_STATE_TO_WAIT (5)
+#define FIBER_STATE_EPOLL_WAITING (6)
 
 #define FIBER_DETACH_NONE (0)
 #define FIBER_DETACH_WAIT_FOR_JOINER (1)
@@ -48,6 +50,10 @@ typedef struct fiber
     int volatile detach_state;
     struct fiber* volatile join_info;
     void* volatile scratch;//to be used by internal fiber mechanisms. be sure mechanisms do not conflict! (ie. only use scratch while a fiber is sleeping/waiting)
+    uint64_t* my_manager;
+    int num_events;
+    struct epoll_event *events;
+    int maxevents;
 } fiber_t;
 
 #ifdef __cplusplus

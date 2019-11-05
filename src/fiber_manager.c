@@ -112,6 +112,7 @@ void fiber_manager_yield(fiber_manager_t* manager)
             break;
         } else if(FIBER_STATE_WAITING == state
                   || FIBER_STATE_DONE == state
+                  || FIBER_STATE_EPOLL_WAITING == state
                   || FIBER_STATE_SAVING_STATE_TO_WAIT == state) {
             if(!manager->maintenance_fiber) {
                 manager->maintenance_fiber = fiber_create_no_sched(102400, &fiber_manager_thread_func, manager);
@@ -257,6 +258,9 @@ int fiber_manager_init(size_t num_threads)
         assert(new_manager);
         new_manager->id = i;
         fiber_managers[i] = new_manager;
+        event_fd = fiber_event_init();
+        fiber_managers[i]->event_fd = event_fd;
+        fiber_managers[i]->timer_fd = event_fd-1;
     }
 
     pthread_attr_t attr;

@@ -63,6 +63,8 @@ typedef struct fiber_manager
     uint64_t poll_count;
     uint64_t event_wait_count;
     uint64_t lock_contention_count;
+    int event_fd;
+    int timer_fd;
 } fiber_manager_t;
 
 #ifdef __cplusplus

@@ -19,6 +19,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/epoll.h>
 
 //this variable controls how long idle threads wait for events, in milliseconds.
 //the value is important: high values may be better for workloads which are not truly parallel,
@@ -69,5 +70,12 @@ extern void fiber_fd_closed(int fd);
 #ifdef __cplusplus
 }
 #endif
+
+extern int fiber_epfd_create(int size);
+extern int __epoll_create_internal(int size);
+extern int fiber_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+extern int __epoll_ctl_internal(int epfd, int op, int fd, struct epoll_event *event);
+extern int fiber_epfd_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+extern int __epfd_wait_internal(int epfd, struct epoll_event *events, int maxevents, int timeout);
 
 #endif
